@@ -23,7 +23,7 @@ def log(msg):
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}")
 
 def handle_promo_popup(page):
-    """处理首页的促销活动弹窗"""
+    """处理促销活动弹窗（Activate/关闭）"""
     log("检测是否有促销活动弹窗...")
     
     # 1. 尝试点击 'Activate' 按钮（如果点击它会直接关闭弹窗并激活折扣）
@@ -40,15 +40,15 @@ def handle_promo_popup(page):
             continue
 
     # 2. 如果找不到 Activate，尝试点击右上角的关闭按钮（×）
-    # 图片中的关闭按钮通常是一个 div 或 button，可能包含 × 或 Close
     close_selectors = [
         'button[aria-label="Close"]',
         'button[aria-label="关闭"]',
         'button:has-text("×")',
-        'div:has-text("×")',
+        'div[role="button"]:has-text("×")',
         'span:has-text("×")',
-        '.close-icon',
-        '[class*="close"]'
+        '[class*="close"]',
+        '[class*="Close"]',
+        '.close-icon'
     ]
     for sel in close_selectors:
         try:
@@ -218,7 +218,7 @@ def login(page):
     # 处理 Cookie 弹窗
     handle_cookie_banner(page)
     
-    # === 新增：处理促销弹窗 ===
+    # 处理促销弹窗
     handle_promo_popup(page)
 
     login_clicked = False
@@ -315,6 +315,8 @@ def main():
         page.goto(DAILY_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
         handle_cookie_banner(page)
+        # ★ 关键修改：进入每日奖励页面后，也要检测并关闭促销弹窗
+        handle_promo_popup(page)
 
         if has_countdown(page):
             log("每日奖励：检测到倒计时，跳过")
@@ -344,6 +346,8 @@ def main():
         page.goto(STORE_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
         handle_cookie_banner(page)
+        # ★ 关键修改：进入商店页面后，也要检测并关闭促销弹窗
+        handle_promo_popup(page)
 
         # 商店逻辑：检查是否有“已领取”文本，没有则点击“免费”按钮
         body_text = get_visible_text(page).lower()

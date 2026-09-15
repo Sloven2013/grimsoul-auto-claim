@@ -22,6 +22,59 @@ ALREADY_TEXTS = ["已领取", "已经领取", "已签到", "Already claimed", "C
 def log(msg):
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}")
 
+def handle_promo_popup(page):
+    """处理首页的促销活动弹窗"""
+    log("检测是否有促销活动弹窗...")
+    
+    # 1. 尝试点击 'Activate' 按钮（如果点击它会直接关闭弹窗并激活折扣）
+    activate_texts = ["Activate", "激活", "Activate Now"]
+    for text in activate_texts:
+        try:
+            loc = page.locator(f'button:has-text("{text}"), a:has-text("{text}")').first
+            if loc.is_visible() and loc.is_enabled():
+                loc.click(timeout=3000)
+                log(f"已点击促销弹窗按钮：{text}")
+                page.wait_for_timeout(2000) # 等待弹窗消失
+                return True
+        except:
+            continue
+
+    # 2. 如果找不到 Activate，尝试点击右上角的关闭按钮（×）
+    # 图片中的关闭按钮通常是一个 div 或 button，可能包含 × 或 Close
+    close_selectors = [
+        'button[aria-label="Close"]',
+        'button[aria-label="关闭"]',
+        'button:has-text("×")',
+        'div:has-text("×")',
+        'span:has-text("×")',
+        '.close-icon',
+        '[class*="close"]'
+    ]
+    for sel in close_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible() and loc.is_enabled():
+                loc.click(timeout=3000)
+                log(f"已点击促销弹窗关闭按钮：{sel}")
+                page.wait_for_timeout(2000)
+                return True
+        except:
+            continue
+
+    # 3. 兜底：尝试直接点击页面上的 "×" 文本
+    try:
+        loc = page.get_by_text("×", exact=True).first
+        if loc.is_visible():
+            loc.click(timeout=3000)
+            log("已通过文本点击关闭按钮：×")
+            page.wait_for_timeout(2000)
+            return True
+    except:
+        pass
+
+    log("未找到促销活动弹窗，或已自动消失")
+    return False
+
 def handle_cookie_banner(page):
     """精准处理 Termly Cookie 弹窗"""
     dialog_selectors = [
@@ -80,18 +133,6 @@ def handle_cookie_banner(page):
         except:
             continue
 
-    for text in primary_buttons:
-        try:
-            loc = page.get_by_text(text, exact=True).first
-            if loc.is_visible() and loc.is_enabled():
-                tag = loc.evaluate("el => el.tagName.toLowerCase()")
-                if tag in ["button", "a", "div", "span"]:
-                    loc.click(timeout=2000)
-                    log(f"通过精确文本点击：{text}")
-                    page.wait_for_timeout(1000)
-                    return True
-        except:
-            pass
     return False
 
 def has_countdown(page):
@@ -173,7 +214,12 @@ def wait_and_check_popup(page, timeout=8000):
 def login(page):
     page.goto("https://grimsoul.com/zh", wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(2000)
+    
+    # 处理 Cookie 弹窗
     handle_cookie_banner(page)
+    
+    # === 新增：处理促销弹窗 ===
+    handle_promo_popup(page)
 
     login_clicked = False
     for text in ["登录", "登入", "Login", "Sign in"]:

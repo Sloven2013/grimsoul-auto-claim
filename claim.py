@@ -4,11 +4,15 @@ Grim Soul 每日奖励 & 免费塔勒（Thaler）自动领取脚本
   - 每日奖励：https://grimsoul.com/rewards
   - 商店：    https://grimsoul.com/store
 仅需在环境变量中提供 GRIMSOUL_ACCOUNT_ID（游戏账号 ID）。
-
 新版登录有两种入口，脚本均支持：
   A. 主页内嵌的 "Log in with User ID" 区块（Enter your user ID + Log in）
   B. 右上角 Log in 按钮弹出的弹窗（Your user ID + Log in）
 默认走 A，A 不存在时自动回退到 B。
+
+结果三态：
+  True  —— 领取成功 / 今日已领取
+  None  —— 已执行点击，但结果未能确认（仅告警，不判失败）
+  False —— 硬失败：登录失败 / 页面打不开 / 找不到可操作按钮（退出码 1）
 """
 import os
 import re
@@ -74,7 +78,6 @@ def goto(page, url, retries=3):
 
 def accept_cookies(page):
     """关闭官网 Cookie 弹窗。
-
     不同地区/IP 下会看到两种形态：
       - 完整表单：Accept All / Reject All / Customize
       - 简化提示：仅 Dismiss（"How we use cookies"）
@@ -85,7 +88,6 @@ def accept_cookies(page):
         form.wait_for(state="attached", timeout=8000)
     except Exception:
         return False
-
     for name in ("Accept All", "Reject All", "Dismiss"):
         try:
             btn = form.get_by_role("button", name=name, exact=True).first
@@ -118,7 +120,6 @@ def dismiss_promo(page):
 # ===================== 登录 =====================
 def is_logged_in(page):
     """根据页面特征判断当前是否已登录。
-
     未登录的 rewards 页面同时存在：
       - 内嵌登录表单 [data-testid="fast-login"] 的输入框
       - "Log in to claim reward" 按钮
@@ -167,13 +168,11 @@ def login_via_inline_form(page):
         user_input.wait_for(state="visible", timeout=10000)
     except Exception:
         return False
-
     # 新版输入框直接可见，无需先点按钮展开；直接填 ID 并提交
     user_input.fill(ACCOUNT_ID)
     log("已在内嵌表单填写 User ID")
     page.locator('[data-testid="fast-login-button-authorization-user-id"]').first.click()
     log("已点击内嵌表单的 Log in")
-
     result = wait_login_result(page)
     if result is True:
         log("登录成功（内嵌表单）")
@@ -197,7 +196,6 @@ def login_via_modal(page):
     except Exception as e:
         log(f"未找到右上角 Log in 按钮：{e}")
         return False
-
     # 弹窗出现后在 dialog 内填写
     try:
         dialog = page.get_by_role("dialog").first
@@ -211,7 +209,6 @@ def login_via_modal(page):
     except Exception as e:
         log(f"登录弹窗操作失败：{e}")
         return False
-
     result = wait_login_result(page)
     if result is True:
         log("登录成功（弹窗）")
@@ -228,12 +225,10 @@ def login(page):
         return False
     accept_cookies(page)
     dismiss_promo(page)
-
     # 可能已经是登录态（复用上下文等场景）
     if is_logged_in(page):
         log("页面已是登录态，无需重复登录")
         return True
-
     # 先尝试内嵌表单；仅当入口不存在（None / False 且无 ID 错误）时再走弹窗
     if page.locator('[data-testid="fast-login"] input').count() > 0:
         result = login_via_inline_form(page)
@@ -243,11 +238,33 @@ def login(page):
             # 明确是 ID 无效，换入口也无意义，直接失败
             return False
         log("内嵌表单登录未成功，尝试改用弹窗登录")
-
     return login_via_modal(page) is True
 
 
 # ===================== 每日奖励 =====================
+def _daily_success_signals(page):
+    """读取每日奖励页面的成功信号：(弹窗出现, 倒计时出现, Claim 按钮消失)"""
+    modal_seen = False
+    timer_seen = False
+    claim_gone = False
+    try:
+        if page.get_by_text("You got reward!", exact=False).first.is_visible():
+            modal_seen = True
+    except Exception:
+        pass
+    try:
+        if page.get_by_text(COUNTDOWN_RE).first.is_visible():
+            timer_seen = True
+    except Exception:
+        pass
+    try:
+        if page.get_by_role("button", name="Claim", exact=True).count() == 0:
+            claim_gone = True
+    except Exception:
+        pass
+    return modal_seen, timer_seen, claim_gone
+
+
 def claim_daily(page):
     if not goto(page, REWARDS_URL):
         return False
@@ -271,32 +288,52 @@ def claim_daily(page):
 
     # 2) 未领取：当日卡片上有 Claim 按钮
     claim = page.get_by_role("button", name="Claim", exact=True).first
-    if claim.count() > 0 and claim.is_visible():
+    if claim.count() == 0 or not claim.is_visible():
+        log("每日奖励：未找到 Claim 按钮，也没有倒计时")
+        screenshot(page, "daily_rewards.png")
+        return False
+
+    try:
+        claim.scroll_into_view_if_needed()
         claim.click()
         log("每日奖励：已点击 Claim")
-        try:
-            page.get_by_text("You got reward!", exact=False).first.wait_for(
-                state="visible", timeout=10000
-            )
-            log("每日奖励：领取成功")
-        except Exception:
-            log("警告：未检测到领取成功弹窗，截取当前领取界面")
+    except Exception as e:
+        log(f"每日奖励：点击 Claim 失败：{e}")
+        screenshot(page, "daily_rewards.png")
+        return False
+
+    # 轮询等待成功信号（弹窗 / 倒计时任一出现即确认），最长 15 秒
+    deadline = time.time() + 15
+    modal_seen = False
+    timer_seen = False
+    while time.time() < deadline:
+        m, t, _ = _daily_success_signals(page)
+        modal_seen = modal_seen or m
+        timer_seen = timer_seen or t
+        if m or t:
+            break
+        page.wait_for_timeout(500)
+
+    if modal_seen or timer_seen:
+        log("每日奖励：领取成功")
+        if modal_seen:
+            # 成功：只截成功弹窗，然后关闭（Back to store）
+            screenshot_dialog(page, "daily_rewards.png")
+            try:
+                page.get_by_role("button", name="Back to store", exact=True).first.click(
+                    timeout=3000
+                )
+                log("已关闭奖励弹窗")
+            except Exception:
+                pass
+        else:
             screenshot(page, "daily_rewards.png")
-            return False
-        # 成功：只截成功弹窗，然后关闭（Back to store）
-        screenshot_dialog(page, "daily_rewards.png")
-        try:
-            page.get_by_role("button", name="Back to store", exact=True).first.click(
-                timeout=3000
-            )
-            log("已关闭奖励弹窗")
-        except Exception:
-            pass
         return True
 
-    log("每日奖励：未找到 Claim 按钮，也没有倒计时，截取当前领取界面")
+    # 已点击但未能确认：归入不确定，不判硬失败（保留截图供人工复核）
+    log("警告：已点击 Claim，但未在 15 秒内确认领取结果，请查看截图复核")
     screenshot(page, "daily_rewards.png")
-    return False
+    return None
 
 
 # ===================== 商店免费塔勒 =====================
@@ -338,21 +375,26 @@ def claim_free_coins(page):
 
     # 2) 未领取：点击 Get free
     free = card.get_by_test_id("free-button")
-    if free.is_visible() and free.is_enabled():
-        free.click()
-        log("商店：已点击 Get free")
+    if not (free.is_visible() and free.is_enabled()):
+        log("商店：Get free 按钮不可用")
+        screenshot(page, "store.png")
+        return False
 
-        # 等待成功弹窗出现
-        try:
-            dialog = page.get_by_role("dialog")
-            dialog.get_by_text("You got reward!", exact=False).first.wait_for(
-                state="visible", timeout=10000
-            )
-        except Exception:
-            log("警告：未检测到领取成功弹窗，截取当前领取界面")
-            screenshot(page, "store.png")
-            return False
+    free.click()
+    log("商店：已点击 Get free")
 
+    # 等待成功弹窗出现
+    dialog_ok = False
+    try:
+        dialog = page.get_by_role("dialog")
+        dialog.get_by_text("You got reward!", exact=False).first.wait_for(
+            state="visible", timeout=10000
+        )
+        dialog_ok = True
+    except Exception:
+        pass
+
+    if dialog_ok:
         # 成功：只截成功弹窗（在点 Claim 确认之前），然后在弹窗中点击 Claim
         screenshot_dialog(page, "store.png")
         try:
@@ -367,34 +409,43 @@ def claim_free_coins(page):
                 )
             except Exception as e:
                 log(f"商店：确认弹窗点击失败：{e}")
-                return False
+                return None
+    else:
+        log("警告：未检测到塔勒领取弹窗，继续等待卡片状态确认")
 
-        # 等待卡片变为 Owned
-        try:
-            card.get_by_role("button", name="Owned", exact=True).first.wait_for(
-                state="visible", timeout=15000
-            )
-            log("商店：免费塔勒领取成功")
-            return True
-        except Exception:
-            log("警告：未等到 Owned 状态，截取当前领取界面")
-            screenshot(page, "store.png")
-            return False
+    # 轮询等待卡片变为 Owned / 出现倒计时，最长 15 秒
+    deadline = time.time() + 15
+    owned = False
+    while time.time() < deadline:
+        if card.get_by_role("button", name="Owned", exact=True).count() > 0 or \
+                card.get_by_text(COUNTDOWN_RE).count() > 0:
+            owned = True
+            break
+        page.wait_for_timeout(500)
 
-    log("商店：Get free 按钮不可用，截取当前领取界面")
+    if owned:
+        log("商店：免费塔勒领取成功")
+        return True
+
+    log("警告：未确认塔勒领取结果，请查看截图复核")
     screenshot(page, "store.png")
-    return False
+    return None
 
 
 # ===================== 主流程 =====================
+def _status_label(value):
+    return {True: "成功", None: "不确定（请看截图）", False: "失败"}.get(value, "未知")
+
+
 def main():
     if not ACCOUNT_ID:
         log("错误：未设置 GRIMSOUL_ACCOUNT_ID 环境变量")
         sys.exit(1)
 
     log("===== 开始执行自动领取 =====")
-    ok_daily = False
-    ok_store = False
+    daily = "未执行"
+    store = "未执行"
+    hard_fail = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -408,19 +459,22 @@ def main():
                 screenshot(page, "login_error.png")
                 sys.exit(1)
 
-            # 领取函数内部按结果自行截图：
-            #   成功 -> 成功弹窗；失败/已领取 -> 当前领取界面
-            ok_daily = claim_daily(page)
-            ok_store = claim_free_coins(page)
+            d = claim_daily(page)
+            s = claim_free_coins(page)
+            daily = _status_label(d)
+            store = _status_label(s)
+            # 只有硬失败（False）才让工作流标红；不确定（None）仅告警
+            if d is False or s is False:
+                hard_fail = True
         except Exception as e:
             log(f"执行异常：{e}")
             screenshot(page, "error.png")
+            sys.exit(1)
         finally:
             browser.close()
 
-    log(f"结果：每日奖励={'成功' if ok_daily else '失败'}，"
-        f"免费塔勒={'成功' if ok_store else '失败'}")
-    if not (ok_daily and ok_store):
+    log(f"结果：每日奖励={daily}，免费塔勒={store}")
+    if hard_fail:
         sys.exit(1)
     log("===== 全部任务完成 =====")
 
